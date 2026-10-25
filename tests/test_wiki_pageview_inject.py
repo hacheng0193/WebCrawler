@@ -5,13 +5,14 @@ What we're protecting:
   * Article ranking sums an article's rows across access methods, keeps only
     *.wikipedia projects, drops non-article titles, and survives a sort-order
     break in the dump.
-  * Daily artifacts (user/automated dumps, top files, priority lists) are
+  * Run artifacts (user/automated dumps, top files, priority lists) are
     found and expired by the retention cleanup.
-  * Yesterday's priority URLs that left today's list are the ones demoted.
+  * The previous run's priority URLs that left this run's list are the ones
+    demoted.
   * The upsert stamps url_score_updated_at, re-queues only rows never fetched
     successfully, and never touches golden rows; demotion only resets
     pageview-priority rows.
-  * Previous days' dumps are deleted once today's top list exists.
+  * Earlier dumps are deleted once this run's top list exists.
   * The ranker scorer never picks rows whose url_score > 1 on either path.
 """
 from __future__ import annotations
@@ -125,7 +126,7 @@ class ArtifactTest(unittest.TestCase):
                 self.assertEqual(wpi.artifact_date_from_name(name), datetime(2026, 9, 30))
         self.assertIsNone(wpi.artifact_date_from_name("notes.txt"))
 
-    def test_cleanup_expires_old_daily_artifacts(self):
+    def test_cleanup_expires_old_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             for name in (
@@ -139,6 +140,19 @@ class ArtifactTest(unittest.TestCase):
             self.assertEqual(
                 sorted(p.name for p in root.iterdir()),
                 ["priority_20260929_user.txt", "top100000_pageviews_20260929_user.txt"],
+            )
+
+    def test_default_retention_keeps_previous_weekly_priority_list(self):
+        # Demotion reads the previous run's list, so cleanup at the start of a
+        # weekly run must not delete it, even when the run is a day late.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "priority_20260922_user.txt").write_text("x")
+            wpi.cleanup_old_artifacts(
+                root, wpi.DEFAULT_RETENTION_DAYS, now=datetime(2026, 9, 30)
+            )
+            self.assertEqual(
+                wpi.load_previous_priority(root, "20260930", "user"), {"x"}
             )
 
 

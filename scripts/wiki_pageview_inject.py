@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Daily script: download Wikimedia pageviews, extract the Top-K Wikipedia
+"""Weekly script: download Wikimedia pageviews, extract the Top-K Wikipedia
 articles, and inject them into crawlerdb with pageview-based scheduler priority.
 
 Ranking uses the `user` agent dump (human traffic) by default and sums each
@@ -36,7 +36,7 @@ MAX_URL_LEN = 2500
 DEFAULT_INJECT_BATCH_SIZE = 1000
 DEFAULT_DOWNLOAD_RETRIES = 3
 DEFAULT_RETRY_BACKOFF_SECONDS = 5.0
-DEFAULT_RETENTION_DAYS = 7
+DEFAULT_RETENTION_DAYS = 45
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 DOWNLOAD_TIMEOUT_SECONDS = 120
 PARTIAL_RETENTION_SECONDS = 24 * 60 * 60
@@ -713,7 +713,7 @@ def iter_injectable_pageviews(
 def delete_previous_dumps(data_dir: str | Path, date_str: str) -> list[Path]:
     """Delete pageview dumps (and partials) dated before date_str.
 
-    Each daily run only needs its own dump once the top list is extracted, and
+    Each run only needs its own dump once the top list is extracted, and
     a user dump is ~730 MB, so older dumps are removed right away instead of
     waiting for the retention window.
     """
@@ -852,7 +852,7 @@ def ensure_domain(crawler_cur, domain: str, shard_id: int) -> tuple[int, float]:
     return int(row[0]), float(row[1])
 
 
-# Every day the top-K list is compared against crawlerdb in this one upsert:
+# Every run the top-K list is compared against crawlerdb in this one upsert:
 #   - new URLs are inserted (should_crawl defaults to TRUE in the table);
 #   - URLs never fetched successfully (last_fetch_ok IS NULL) are put back on
 #     the schedule (should_crawl = TRUE) unless they were scheduled within the
@@ -952,7 +952,7 @@ def inject_pageview_batch(
 
 
 def demotion_urls(previous: set[str] | None, current: list[str]) -> list[str]:
-    """Yesterday's priority URLs that are not in today's list."""
+    """Previous run's priority URLs that are not in this run's list."""
     if not previous:
         return []
     return sorted(previous.difference(current))
@@ -993,8 +993,8 @@ def inject_top_pageviews(
     batch_size: int = DEFAULT_INJECT_BATCH_SIZE,
     previous_priority: set[str] | None = None,
 ) -> InjectionStats:
-    """Upsert today's top URLs as priority rows, and demote yesterday's priority
-    URLs that dropped out of the list, in one transaction."""
+    """Upsert this run's top URLs as priority rows, and demote the previous run's
+    priority URLs that dropped out of the list, in one transaction."""
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
 
@@ -1123,7 +1123,7 @@ def inject_top_pageviews(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download daily Wikimedia pageviews, extract the Top-K Wikipedia articles, and inject crawlerdb scores."
+        description="Download weekly Wikimedia pageviews, extract the Top-K Wikipedia articles, and inject crawlerdb scores."
     )
     parser.add_argument(
         "--agent",
