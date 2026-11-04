@@ -9,6 +9,7 @@ from pathlib import Path
 from libs.ipc.jsonio import atomic_write_json
 from libs.ipc.queue_scan import list_queued_domain_ids
 from libs.stats.delta_writer import StatsDeltaWriter, now_iso
+from .domain_health import DomainHealthTracker
 from .selection.base import SelectionStrategy
 
 
@@ -58,10 +59,13 @@ class OffererService:
         cfg: OffererConfig,
         deriv: OffererDerivation,
         selector: SelectionStrategy,
+        health: DomainHealthTracker | None = None,
     ):
         self.cfg = cfg
         self.deriv = deriv
         self.selector = selector
+        # Optional; only the global refill path consults it.
+        self.health = health
         self.stats = StatsDeltaWriter(stats_dir=cfg.stats_dir)
         self._next_shard_offset = 0
 
@@ -290,13 +294,26 @@ class OffererService:
             slots_to_fill * self.cfg.peek_multiplier,
             self.cfg.peek_hard_cap,
         )
+        health_excluded: set[int] = set()
+        if self.health is not None:
+            self.health.maybe_refresh(shard_start, shard_end)
+            health_excluded = self.health.excluded_now()
         try:
             candidates = self.selector.peek_global_candidates(
                 limit=peek_limit,
-                exclude_domain_ids=set(existing_domain_ids),
+                exclude_domain_ids=set(existing_domain_ids) | health_excluded,
                 shard_start=shard_start,
                 shard_end=shard_end,
             )
+            if not candidates and health_excluded:
+                # Work-conserving: an idle crawler is worse than one fed from a
+                # demoted domain.
+                candidates = self.selector.peek_global_candidates(
+                    limit=peek_limit,
+                    exclude_domain_ids=set(existing_domain_ids),
+                    shard_start=shard_start,
+                    shard_end=shard_end,
+                )
         except Exception as e:
             logger.error(
                 "offer.peek_error",
@@ -378,8 +395,12 @@ class OffererService:
                 "skipped_empty": skipped_empty,
                 "slots_requested": slots_requested,
                 "slots_filled": len(new_domains),
+                "health_excluded": len(health_excluded),
             },
         )
+
+        if self.health is not None:
+            self.health.note_offered(new_domains.keys())
 
         if total_picked == 0:
             self._log_shard_refill(
@@ -422,6 +443,7 @@ class OffererService:
                 "offer_refill_shards_visited": len(visited_shards),
                 "offer_peek_candidates_returned": len(candidates),
                 "offer_claim_empty_skipped": skipped_empty,
+                "offer_health_excluded": len(health_excluded),
             },
             domains={
                 int(domain_id): {"num_scheduled": cnt}
