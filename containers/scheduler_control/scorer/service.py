@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from psycopg2.extras import execute_values
 from sqlalchemy.orm import sessionmaker
@@ -57,6 +58,10 @@ class GoldenDiscoveryRankerService:
         self.cfg = cfg
         self.Session = Session
         self.scorer = scorer
+        # Steering TTL path: per-shard {domain_id: newest url_score_updated_at
+        # this worker has rescored}.  Process-local and lost on restart; a
+        # missing or stale watermark only costs extra tombstone reads.
+        self._watermarks: dict[int, dict[int, datetime]] = {}
 
     @staticmethod
     def _table(shard_id: int) -> str:
@@ -89,80 +94,197 @@ class GoldenDiscoveryRankerService:
             for i in range(self.cfg.total_shards)
         ]
 
+    def _steering_unscored_sql(self, table: str) -> str:
+        # Never-scored rows of golden-tier domains, as a LATERAL top-N per
+        # domain.  WHY this shape and not a flat `JOIN domain_state ...
+        # ORDER BY d.domain_score DESC, u.url_score_updated_at`: the flat
+        # form forces a blocking Sort, because the lead ORDER BY key
+        # (domain_score) lives on domain_state and has only ~3 distinct
+        # values, so within a tier url_score_updated_at must be merged
+        # ACROSS all domains — no index can produce that.  The Sort blocks
+        # the LIMIT, so the planner materialises every matching row (in the
+        # backlog regime ~all rows) via a Seq Scan.  Measured on a 64M-row
+        # shard the flat plan cost ~11.5M and ignored the rescore index.
+        #
+        # The LATERAL drives from domain_state (golden domains for this
+        # shard, via idx_domain_state_shard_score, ordered domain_score
+        # DESC) and for each domain reads idx_..._golden_discovery_v2_rescore
+        # (domain_id, url_score_updated_at ASC NULLS FIRST).  `IS NULL` is a
+        # range on that index (the NULLS FIRST prefix), so the scan stops at
+        # the first scored row.
+        #
+        # `d.shard_id = %(shard_id)s` is required AND correct: every domain
+        # in url_state_current_{shard} has domain_state.shard_id=shard, and
+        # the equality lets the shard_score index yield domain_score DESC
+        # order (its lead column is shard_id).
+        #
+        # No FOR UPDATE here: a locking LATERAL locks up to LIMIT rows in
+        # EVERY golden domain before the outer LIMIT discards most of them.
+        # On YB each lock is a write, so that dominated the batch (lab: 11.8s
+        # with the lock vs 0.3s without, 10 domains).  _lock_due_sql locks
+        # only the chosen candidates.
+        return f"""
+            SELECT u.url, u.inlink_count_approx, u.inlink_count_external,
+                   u.anchor_text, u.domain_id, u.url_score_updated_at
+            FROM domain_state d
+            CROSS JOIN LATERAL (
+                SELECT url, inlink_count_approx, inlink_count_external,
+                       anchor_text, domain_id, url_score_updated_at
+                FROM {table} u
+                WHERE u.domain_id = d.domain_id
+                  AND u.should_crawl = TRUE
+                  AND u.first_seen < NOW() - make_interval(days => %(min_age_days)s)
+                  AND u.url_score_updated_at IS NULL
+                  AND {MANUAL_PRIORITY_EXCLUDED}
+                LIMIT %(limit)s
+            ) u
+            WHERE d.shard_id = %(shard_id)s
+              AND d.domain_score > 0
+            ORDER BY d.domain_score DESC
+            LIMIT %(limit)s
+            """
+
+    def _steering_stale_sql(self, table: str) -> str:
+        # TTL refresh: rows scored before %(ttl_cutoff)s.  Same LATERAL shape
+        # as the unscored query, but the due condition is a closed range on
+        # the rescore index, [watermark, ttl_cutoff), so YB seeks straight to
+        # the domain's due rows and stops at the cutoff.  The previous
+        # `IS NULL OR < cutoff` could not become an index bound; the TTL was
+        # only a Filter, so every domain with fewer than LIMIT due rows was
+        # scanned to the end of its index range (2-3M rows per batch on the
+        # big shards, issue #108).
+        #
+        # The per-domain watermark (see _watermarks) skips the delete
+        # tombstones that each rescore leaves at the old index position:
+        # every UPDATE moves the entry to the tail of the domain range, so
+        # without it each batch re-reads the previous batches' tombstones.
+        #
+        # ORDER BY must stay `ASC NULLS FIRST` to match the index order,
+        # otherwise the planner cannot use the index for the LIMIT.
+        return f"""
+            SELECT u.url, u.inlink_count_approx, u.inlink_count_external,
+                   u.anchor_text, u.domain_id, u.url_score_updated_at
+            FROM domain_state d
+            LEFT JOIN unnest(
+                %(wm_domain_ids)s::bigint[], %(wm_values)s::timestamptz[]
+            ) AS w(domain_id, watermark) ON w.domain_id = d.domain_id
+            CROSS JOIN LATERAL (
+                SELECT url, inlink_count_approx, inlink_count_external,
+                       anchor_text, domain_id, url_score_updated_at
+                FROM {table} u
+                WHERE u.domain_id = d.domain_id
+                  AND u.should_crawl = TRUE
+                  AND u.first_seen < NOW() - make_interval(days => %(min_age_days)s)
+                  AND u.url_score_updated_at >= COALESCE(w.watermark, '-infinity'::timestamptz)
+                  AND u.url_score_updated_at < %(ttl_cutoff)s
+                  AND {MANUAL_PRIORITY_EXCLUDED}
+                ORDER BY u.url_score_updated_at ASC NULLS FIRST
+                LIMIT %(limit)s
+            ) u
+            WHERE d.shard_id = %(shard_id)s
+              AND d.domain_score > 0
+            ORDER BY d.domain_score DESC,
+                     u.url_score_updated_at ASC NULLS FIRST
+            LIMIT %(limit)s
+            """
+
+    def _lock_due_sql(self, table: str) -> str:
+        # Phase 2: lock the chosen candidates by primary key.  SKIP LOCKED
+        # leaves rows another worker already claimed; the due condition is
+        # re-checked so a row another worker rescored after our candidate
+        # read is not scored twice.  ttl_cutoff = datetime.min means only
+        # never-scored rows are due (write-once).
+        return f"""
+            SELECT url, inlink_count_approx, inlink_count_external, anchor_text
+            FROM {table}
+            WHERE url = ANY(%(urls)s)
+              AND should_crawl = TRUE
+              AND (url_score_updated_at IS NULL
+                   OR url_score_updated_at < %(ttl_cutoff)s)
+              AND {MANUAL_PRIORITY_EXCLUDED}
+            FOR UPDATE SKIP LOCKED
+            """
+
+    def _pick_steering(self, cur, table: str, shard_id: int):
+        """Claim up to batch_size due URLs from golden-tier domains.
+
+        Gates: min_age skips URLs younger than min_age_days (they keep the
+        v1 inline score; 0 = no-op).  Due rows are never-scored rows first,
+        then (if rescore_ttl_days > 0) rows scored before the TTL cutoff.
+        They are separate queries because the `IS NULL OR < cutoff`
+        disjunction cannot be an index range.  rescore_ttl_days <= 0 =
+        write-once.
+
+        Returns (rows, unscored, rescored, new_watermarks, reset_watermarks).
+        Watermarks are returned rather than stored so the caller applies
+        them only after the transaction commits.
+        """
+        params = {
+            "min_age_days": self.cfg.min_age_days,
+            "shard_id": shard_id,
+            "limit": self.cfg.batch_size,
+            "ttl_cutoff": datetime.min.replace(tzinfo=timezone.utc),
+        }
+        cur.execute(self._steering_unscored_sql(table), params)
+        candidates = cur.fetchall()
+        unscored_urls = {row[0] for row in candidates}
+
+        new_watermarks: dict[int, datetime] = {}
+        reset_watermarks = False
+        remaining = self.cfg.batch_size - len(candidates)
+        if self.cfg.rescore_ttl_days > 0 and remaining > 0:
+            shard_wm = self._watermarks.get(shard_id, {})
+            params.update(
+                limit=remaining,
+                ttl_cutoff=datetime.now(timezone.utc)
+                - timedelta(days=self.cfg.rescore_ttl_days),
+                wm_domain_ids=list(shard_wm.keys()),
+                wm_values=list(shard_wm.values()),
+            )
+            cur.execute(self._steering_stale_sql(table), params)
+            stale = cur.fetchall()
+            candidates.extend(stale)
+            # Candidates are an ascending prefix of each domain's due range,
+            # so the max timestamp per domain is a safe lower bound for its
+            # next batch.  Rows SKIP LOCKED drops below are being scored by
+            # the worker holding the lock.
+            for row in stale:
+                domain_id, updated_at = row[4], row[5]
+                prev = new_watermarks.get(domain_id)
+                if prev is None or updated_at > prev:
+                    new_watermarks[domain_id] = updated_at
+            # A short read means every golden domain in the shard is drained
+            # above its watermark.  Start the next pass from scratch so rows
+            # that fell below a watermark (a lock holder rolled back,
+            # should_crawl flipped on, ...) are not lost.
+            reset_watermarks = len(stale) < remaining
+
+        if not candidates:
+            return [], 0, 0, new_watermarks, reset_watermarks
+        cur.execute(
+            self._lock_due_sql(table),
+            {
+                "urls": [row[0] for row in candidates],
+                "ttl_cutoff": params["ttl_cutoff"],
+            },
+        )
+        rows = cur.fetchall()
+        unscored = sum(1 for row in rows if row[0] in unscored_urls)
+        return rows, unscored, len(rows) - unscored, new_watermarks, reset_watermarks
+
     def _score_batch(self, shard_id: int) -> int:
         table = self._table(shard_id)
+        unscored = rescored = 0
+        # Watermark changes are applied only after the transaction commits,
+        # so a failed batch never advances past rows it did not score.
+        new_watermarks: dict[int, datetime] = {}
+        reset_watermarks = False
 
         with self.Session.begin() as sess:
             with sess.connection().connection.cursor() as cur:
                 if self.cfg.domain_priority_steering_enabled:
-                    # Pick due URLs from golden-tier domains, as a LATERAL
-                    # top-N-per-domain.  WHY this shape and not a flat
-                    # `JOIN domain_state ... ORDER BY d.domain_score DESC,
-                    # u.url_score_updated_at`: the flat form forces a blocking
-                    # Sort, because the lead ORDER BY key (domain_score) lives
-                    # on domain_state and has only ~3 distinct values, so within
-                    # a tier url_score_updated_at must be merged ACROSS all
-                    # domains — no index can produce that.  The Sort blocks the
-                    # LIMIT, so the planner materialises every matching row (in
-                    # the backlog regime ~all rows) via a Seq Scan.  Measured on
-                    # a 64M-row shard the flat plan cost ~11.5M and ignored the
-                    # rescore index entirely.
-                    #
-                    # The LATERAL drives from domain_state (golden domains for
-                    # this shard, via idx_domain_state_shard_score, ordered
-                    # domain_score DESC) and for each domain does a plain ordered
-                    # index scan on idx_..._golden_discovery_v2_rescore
-                    # (domain_id, url_score_updated_at) to take its stalest due
-                    # URLs.  No big scan; the only Sort is a top-N heapsort over
-                    # the few-thousand rows actually pulled.
-                    #
-                    # `d.shard_id = %s` is required AND correct: every domain in
-                    # url_state_current_{shard} has domain_state.shard_id=shard,
-                    # and the equality lets the shard_score index yield
-                    # domain_score DESC order (its lead column is shard_id).
-                    #
-                    # Gates (unchanged): min_age skips URLs younger than
-                    # min_age_days (they keep the v1 inline score; 0 = no-op);
-                    # TTL re-picks never-scored OR rows older than
-                    # rescore_ttl_days. rescore_ttl_days<=0 = write-once (drop
-                    # the OR branch, not `< NOW() - interval '0'` which would
-                    # match every already-scored row).
-                    params: list = [self.cfg.min_age_days]
-                    if self.cfg.rescore_ttl_days > 0:
-                        ttl_clause = (
-                            "(u.url_score_updated_at IS NULL "
-                            "OR u.url_score_updated_at < NOW() - make_interval(days => %s))"
-                        )
-                        params.append(self.cfg.rescore_ttl_days)
-                    else:
-                        ttl_clause = "u.url_score_updated_at IS NULL"
-                    # %s order matches text order: min_age, [ttl], inner LIMIT,
-                    # shard_id, outer LIMIT.
-                    params.extend([self.cfg.batch_size, shard_id, self.cfg.batch_size])
-                    cur.execute(
-                        f"""
-                        SELECT u.url, u.inlink_count_approx, u.inlink_count_external, u.anchor_text
-                        FROM domain_state d
-                        CROSS JOIN LATERAL (
-                            SELECT url, inlink_count_approx, inlink_count_external,
-                                   anchor_text, url_score_updated_at
-                            FROM {table} u
-                            WHERE u.domain_id = d.domain_id
-                              AND u.should_crawl = TRUE
-                              AND u.first_seen < NOW() - make_interval(days => %s)
-                              AND {ttl_clause}
-                              AND {MANUAL_PRIORITY_EXCLUDED}
-                            ORDER BY u.url_score_updated_at ASC NULLS FIRST
-                            LIMIT %s
-                            FOR UPDATE OF u SKIP LOCKED
-                        ) u
-                        WHERE d.shard_id = %s
-                          AND d.domain_score > 0
-                        ORDER BY d.domain_score DESC,
-                                 u.url_score_updated_at ASC NULLS FIRST
-                        LIMIT %s
-                        """,
-                        tuple(params),
+                    fetched, unscored, rescored, new_watermarks, reset_watermarks = (
+                        self._pick_steering(cur, table, shard_id)
                     )
                 else:
                     cur.execute(
@@ -178,8 +300,11 @@ class GoldenDiscoveryRankerService:
                         """,
                         (self.cfg.batch_size,),
                     )
-                fetched = cur.fetchall()
+                    fetched = cur.fetchall()
+                    unscored = len(fetched)
                 if not fetched:
+                    if reset_watermarks:
+                        self._watermarks.pop(shard_id, None)
                     return 0
                 urls = [row[0] for row in fetched]
 
@@ -219,6 +344,11 @@ class GoldenDiscoveryRankerService:
                 )
                 scored = len(rows)
 
+        if reset_watermarks:
+            self._watermarks.pop(shard_id, None)
+        elif new_watermarks:
+            self._watermarks.setdefault(shard_id, {}).update(new_watermarks)
+
         logger.info(
             "golden_discovery_ranker_v1.score_batch",
             extra={
@@ -226,6 +356,10 @@ class GoldenDiscoveryRankerService:
                 "worker_id": self.cfg.worker_id,
                 "shard_id": shard_id,
                 "scored_urls": scored,
+                "unscored_urls": unscored,
+                "rescored_urls": rescored,
+                "watermark_domains": len(self._watermarks.get(shard_id, {})),
+                "watermark_reset": reset_watermarks,
             },
         )
         return scored
