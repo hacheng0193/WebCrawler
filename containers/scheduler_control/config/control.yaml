@@ -18,6 +18,26 @@ offerer:
   low_watermark_domains: 120
   per_domain_url_cap: 100
 
+  # Domain health feedback (global refill path only). Demotes domains whose
+  # trailing domain_stats_daily counters show mostly failed fetches or almost
+  # no results for the URLs offered; a demoted domain still gets one probe
+  # batch per probe_interval_sec. No DB writes. Override the switch per-env
+  # with OFFERER_DOMAIN_HEALTH_ENABLED=true.
+  domain_health:
+    enabled: false
+    window_days: 3
+    refresh_sec: 900
+    # ok / (ok + fail) < min_ok_rate over >= min_results results
+    min_results: 50
+    min_ok_rate: 0.2
+    # (ok + fail) / scheduled < min_response_rate over >= min_scheduled offered
+    min_scheduled: 1000
+    min_response_rate: 0.05
+    probe_interval_sec: 21600
+    # Skip demotion when results / scheduled over the whole shard range is
+    # below this (ingestor or stats behind, e.g. the 11/01 partition outage).
+    pipeline_min_response_rate: 0.5
+
 
 postgres:
   dsn: "postgresql+psycopg2://yugabyte:yugabyte@172.16.191.3:5433/crawlerdb"

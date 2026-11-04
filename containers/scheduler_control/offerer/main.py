@@ -8,6 +8,7 @@ from sqlalchemy.orm import sessionmaker
 from libs.config.loader import load_yaml, require
 from libs.obslog import configure as configure_logging
 
+from .domain_health import DomainHealthConfig, DomainHealthTracker, make_stats_loader
 from .service import OffererDerivation, OffererConfig, OffererService
 from .selection.golden_discovery_ranker_v1_strategy import GoldenDiscoveryRankerV1Strategy
 from .selection.example_strategy import ExampleStrategy
@@ -75,7 +76,29 @@ def main() -> None:
         peek_hard_cap=int(offerer.get("peek_hard_cap", 1000)),
     )
 
-    OffererService(cfg, deriv, selector).run_forever()
+    health_raw = offerer.get("domain_health") or {}
+    health_enabled = os.environ.get("OFFERER_DOMAIN_HEALTH_ENABLED")
+    health_cfg = DomainHealthConfig(
+        enabled=(
+            health_enabled.strip().lower() in {"1", "true", "yes", "on"}
+            if health_enabled is not None
+            else bool(health_raw.get("enabled", False))
+        ),
+        window_days=int(health_raw.get("window_days", 3)),
+        refresh_sec=int(health_raw.get("refresh_sec", 900)),
+        min_results=int(health_raw.get("min_results", 50)),
+        min_ok_rate=float(health_raw.get("min_ok_rate", 0.2)),
+        min_scheduled=int(health_raw.get("min_scheduled", 1000)),
+        min_response_rate=float(health_raw.get("min_response_rate", 0.05)),
+        probe_interval_sec=int(health_raw.get("probe_interval_sec", 21600)),
+        pipeline_min_response_rate=float(health_raw.get("pipeline_min_response_rate", 0.5)),
+    )
+    health = (
+        DomainHealthTracker(health_cfg, make_stats_loader(Session))
+        if health_cfg.enabled else None
+    )
+
+    OffererService(cfg, deriv, selector, health=health).run_forever()
 
 
 if __name__ == "__main__":

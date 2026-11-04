@@ -35,6 +35,7 @@ Runtime behavior per offerer:
    - Phase A: score-aware (`url_score`, `domain_score`, `last_scheduled`, `first_seen`)
    - Golden Discovery Ranker v1 mode (`OFFERER_STRATEGY=golden_discovery_ranker_v1`): prefer rows with refreshed `url_score_updated_at`, then highest `url_score`
    - Phase B: fairness (`last_scheduled`, `first_seen`)
+   - Domain health (`offerer.domain_health.enabled`, global refill path only): every `refresh_sec` the offerer reads its shards' trailing `domain_stats_daily` counters and leaves out domains with `ok / (ok + fail) < min_ok_rate` or `(ok + fail) / scheduled < min_response_rate`. Each such domain still gets one probe batch per `probe_interval_sec`, and is offered as usual when no other domain is available. No domain is demoted while the shard range as a whole shows `results / scheduled < pipeline_min_response_rate` (ingest behind or down). Read-only.
 4. Atomically update selected rows:
    - `should_crawl=FALSE`
    - `last_scheduled=NOW()`
