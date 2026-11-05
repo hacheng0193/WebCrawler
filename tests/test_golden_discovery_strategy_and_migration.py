@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -340,6 +341,11 @@ class _FakeCursor:
         ]
 
 
+class _EmptyCursor(_FakeCursor):
+    def fetchall(self):
+        return []
+
+
 class _FakeRawConnection:
     def __init__(self, cursor):
         self._cursor = cursor
@@ -467,112 +473,98 @@ class GoldenDiscoveryRankerSteeringTest(unittest.TestCase):
         self.assertNotIn("domain_score", select_sql)
         self.assertEqual(select_params, (1000,))
 
-    def test_steering_uses_lateral_per_domain_against_golden_tiers(self):
-        cursor = _FakeCursor()
-        # Defaults: min_age_days=3, rescore_ttl_days=5 (see config dataclass).
-        service = _make_steering_service(cursor, steering=True, batch_size=1000)
-
-        with patch.object(scorer_service, "execute_values", lambda *a, **kw: None):
-            service._score_batch(7)
-
-        select_sql, select_params = cursor.executed[0]
-        # LATERAL top-N per golden domain: drive from domain_state, scan each
-        # domain's due URLs via the per-domain rescore index. A flat
-        # `JOIN domain_state ... ORDER BY d.domain_score, u.url_score_updated_at`
-        # forces a blocking Sort and ignores the index (see service.py / PR).
-        self.assertIn("FROM domain_state d", select_sql)
-        self.assertIn("CROSS JOIN LATERAL", select_sql)
-        self.assertIn("FROM url_state_current_007 u", select_sql)
-        self.assertIn("u.domain_id = d.domain_id", select_sql)
-        self.assertIn("d.domain_score > 0", select_sql)
-        # shard_id equality: required for the shard_score index to yield
-        # domain_score DESC order, and correct (domains here all have shard_id=7).
-        self.assertIn("d.shard_id = %s", select_sql)
-        # Locking lives inside the LATERAL so concurrent workers skip each other.
-        self.assertIn("FOR UPDATE OF u SKIP LOCKED", select_sql)
-
-        # min_age gate.
-        self.assertIn("u.first_seen < NOW() - make_interval(days => %s)", select_sql)
-        # TTL refresh: re-pick never-scored OR stale-scored rows.
-        self.assertIn("u.url_score_updated_at IS NULL", select_sql)
-        self.assertIn(
-            "u.url_score_updated_at < NOW() - make_interval(days => %s)",
-            select_sql,
+    def _steering_selects(self, shard_id, **cfg):
+        # Empty candidate reads, so the batch issues exactly the unscored
+        # and stale candidate queries and stops (no lock query).
+        cursor = _EmptyCursor()
+        service = GoldenDiscoveryRankerService(
+            cfg=GoldenDiscoveryRankerConfig(
+                total_shards=256,
+                num_workers=1,
+                worker_id=0,
+                scan_interval_sec=60,
+                max_batches_per_shard=1,
+                domain_priority_steering_enabled=True,
+                **cfg,
+            ),
+            Session=_FakeScorerSessionFactory(cursor),
+            scorer=_FakeScorer(),
         )
-        # Per-domain oldest-first inner order; tier-priority outer order.
-        self.assertIn("ORDER BY u.url_score_updated_at ASC NULLS FIRST", select_sql)
-        self.assertIn("ORDER BY d.domain_score DESC", select_sql)
-        # Params in text order: min_age, ttl, inner LIMIT, shard_id, outer LIMIT.
-        self.assertEqual(select_params, (3, 5, 1000, 7, 1000))
+        with patch.object(scorer_service, "execute_values", lambda *a, **kw: None):
+            service._score_batch(shard_id)
+        return cursor.executed
+
+    def test_steering_uses_lateral_per_domain_against_golden_tiers(self):
+        # Defaults: min_age_days=3, rescore_ttl_days=5 (see config dataclass).
+        executed = self._steering_selects(7, batch_size=1000)
+        self.assertEqual(len(executed), 2)
+        for select_sql, select_params in executed:
+            # LATERAL top-N per golden domain: drive from domain_state, scan
+            # each domain's due URLs via the per-domain rescore index. A flat
+            # `JOIN domain_state ... ORDER BY d.domain_score, u.url_score_updated_at`
+            # forces a blocking Sort and ignores the index (see service.py).
+            self.assertIn("FROM domain_state d", select_sql)
+            self.assertIn("CROSS JOIN LATERAL", select_sql)
+            self.assertIn("FROM url_state_current_007 u", select_sql)
+            self.assertIn("u.domain_id = d.domain_id", select_sql)
+            self.assertIn("d.domain_score > 0", select_sql)
+            # shard_id equality: required for the shard_score index to yield
+            # domain_score DESC order, and correct (domains here all have shard_id=7).
+            self.assertIn("d.shard_id = %(shard_id)s", select_sql)
+            self.assertIn("ORDER BY d.domain_score DESC", select_sql)
+            # Candidate reads take no locks; only chosen rows are locked.
+            self.assertNotIn("FOR UPDATE", select_sql)
+            # min_age gate.
+            self.assertIn(
+                "u.first_seen < NOW() - make_interval(days => %(min_age_days)s)",
+                select_sql,
+            )
+            self.assertEqual(select_params["min_age_days"], 3)
+            self.assertEqual(select_params["shard_id"], 7)
+
+        unscored_sql, unscored_params = executed[0]
+        self.assertIn("u.url_score_updated_at IS NULL", unscored_sql)
+        self.assertEqual(unscored_params["limit"], 1000)
+        # TTL refresh: stale rows as a closed range on the rescore index, in
+        # index order.
+        stale_sql, _ = executed[1]
+        self.assertIn("u.url_score_updated_at < %(ttl_cutoff)s", stale_sql)
+        self.assertIn("ORDER BY u.url_score_updated_at ASC NULLS FIRST", stale_sql)
 
     def test_steering_query_uses_no_write_once_only_filter(self):
         # Guard against regressing to the v1 write-once behavior: the steering
-        # query must NOT gate solely on `url_score_updated_at IS NULL` — that
-        # would score each URL once and never refresh as inlinks accumulate.
-        cursor = _FakeCursor()
-        service = _make_steering_service(cursor, steering=True, batch_size=500)
-
-        with patch.object(scorer_service, "execute_values", lambda *a, **kw: None):
-            service._score_batch(3)
-
-        select_sql, _ = cursor.executed[0]
-        self.assertIn("OR u.url_score_updated_at <", select_sql)
+        # path must also pick stale-scored rows, not only
+        # `url_score_updated_at IS NULL` — that would score each URL once and
+        # never refresh as inlinks accumulate.
+        executed = self._steering_selects(3, batch_size=500)
+        self.assertTrue(
+            any("u.url_score_updated_at < %(ttl_cutoff)s" in sql for sql, _ in executed)
+        )
 
     def test_steering_gate_days_are_configurable(self):
-        cursor = _FakeCursor()
-        service = GoldenDiscoveryRankerService(
-            cfg=GoldenDiscoveryRankerConfig(
-                total_shards=256,
-                num_workers=1,
-                worker_id=0,
-                batch_size=250,
-                scan_interval_sec=60,
-                max_batches_per_shard=1,
-                domain_priority_steering_enabled=True,
-                rescore_ttl_days=30,
-                min_age_days=7,
-            ),
-            Session=_FakeScorerSessionFactory(cursor),
-            scorer=_FakeScorer(),
+        before = datetime.now(timezone.utc)
+        executed = self._steering_selects(
+            1, batch_size=250, rescore_ttl_days=30, min_age_days=7
         )
-
-        with patch.object(scorer_service, "execute_values", lambda *a, **kw: None):
-            service._score_batch(1)
-
-        _, select_params = cursor.executed[0]
-        # (min_age, ttl, inner LIMIT, shard_id, outer LIMIT).
-        self.assertEqual(select_params, (7, 30, 250, 1, 250))
+        _, stale_params = executed[1]
+        self.assertEqual(stale_params["min_age_days"], 7)
+        self.assertEqual(stale_params["limit"], 250)
+        self.assertAlmostEqual(
+            (before - timedelta(days=30) - stale_params["ttl_cutoff"]).total_seconds(),
+            0,
+            delta=5,
+        )
 
     def test_steering_ttl_zero_is_write_once(self):
-        # rescore_ttl_days<=0 must be true write-once: only never-scored rows,
-        # with the TTL OR-branch (and its interval param) dropped entirely.
+        # rescore_ttl_days<=0 must be true write-once: only never-scored rows.
         # Emitting `< NOW() - interval '0'` instead would match every
         # already-scored row and re-score the whole pool on every pass.
-        cursor = _FakeCursor()
-        service = GoldenDiscoveryRankerService(
-            cfg=GoldenDiscoveryRankerConfig(
-                total_shards=256,
-                num_workers=1,
-                worker_id=0,
-                batch_size=100,
-                scan_interval_sec=60,
-                max_batches_per_shard=1,
-                domain_priority_steering_enabled=True,
-                rescore_ttl_days=0,
-                min_age_days=3,
-            ),
-            Session=_FakeScorerSessionFactory(cursor),
-            scorer=_FakeScorer(),
-        )
-
-        with patch.object(scorer_service, "execute_values", lambda *a, **kw: None):
-            service._score_batch(2)
-
-        select_sql, select_params = cursor.executed[0]
+        executed = self._steering_selects(2, batch_size=100, rescore_ttl_days=0)
+        self.assertEqual(len(executed), 1)
+        select_sql, select_params = executed[0]
         self.assertIn("u.url_score_updated_at IS NULL", select_sql)
-        self.assertNotIn("OR u.url_score_updated_at <", select_sql)
-        # TTL param dropped: (min_age, inner LIMIT, shard_id, outer LIMIT).
-        self.assertEqual(select_params, (3, 100, 2, 100))
+        self.assertNotIn("u.url_score_updated_at <", select_sql)
+        self.assertEqual(select_params["limit"], 100)
 
 
 class _FakeInlineRanker:
