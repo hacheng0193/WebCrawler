@@ -204,12 +204,18 @@
         {
           "datasource": {"type": "loki", "uid": "loki"},
           "refId": "A",
-          "expr": "sum by (src) (count_over_time({service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.start\"} |~ `\"domain\": \"[^\"]*wikipedia\\.org\"` | json src=\"source\" [5m]))",
-          "legendFormat": "{{src}}"
+          "expr": "sum(count_over_time({service=\"crawler\", worker_id=\"0\", event=\"request.start\"} |= `wikipedia.org\", \"source\": \"normal\"` [5m]))",
+          "legendFormat": "normal"
+        },
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "refId": "B",
+          "expr": "sum(count_over_time({service=\"crawler\", worker_id=\"0\", event=\"request.start\"} |= `wikipedia.org\", \"source\": \"manual\"` [5m]))",
+          "legendFormat": "manual"
         }
       ],
-      "title": "Wikipedia fetch starts by source (per 5m)",
-      "description": "Normal (offerer queue) vs manual (bulk crawl API) request.start on *.wikipedia.org. All of wikipedia.org is one domain, so normal at 0 while manual keeps running means its batch is stuck on the worker that owns shard 0 (crawler_00): see the panels below. Lines logged before the source field existed show an empty source.",
+      "title": "Wikipedia fetch starts on crawler_00 by source (per 5m)",
+      "description": "Normal (offerer queue) vs manual (bulk crawl API) request.start on *.wikipedia.org. wikipedia.org is pinned to shard 0, so it is always crawled by crawler_00 and this panel ignores the worker filter. All of wikipedia.org is one domain: normal at 0 while manual keeps running means its batch is stuck (see the panels below). The source field exists since 2026-11-11; earlier lines are not counted.",
       "type": "timeseries"
     },
     {
