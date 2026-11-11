@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from time import monotonic
 
 import tldextract
 from w3lib.url import canonicalize_url
@@ -46,6 +47,9 @@ class HtmlSpider(scrapy.Spider):
         self._pending_requests = 0
         self._max_pending_requests = 0
         self._domain_pending: dict[int, int] = {}
+        # Last time each open domain batch was loaded or had a request finish.
+        self._domain_progress: dict[int, float] = {}
+        self._domain_stalled: dict[int, float] = {}
         self._heartbeat_task: twisted_task.LoopingCall | None = None
         self._top_up_task: twisted_task.LoopingCall | None = None
 
@@ -75,6 +79,10 @@ class HtmlSpider(scrapy.Spider):
         )
         spider.top_up_interval_sec = float(
             crawler.settings.getfloat("IPC_TOP_UP_INTERVAL_SEC", 5.0)
+        )
+        # 0 disables the spider.domain_stalled warning; heartbeat fields stay.
+        spider.domain_stall_warn_sec = max(
+            0.0, crawler.settings.getfloat("DOMAIN_STALL_WARN_SEC", 600.0)
         )
 
         return spider
@@ -169,6 +177,52 @@ class HtmlSpider(scrapy.Spider):
             "scheduler_size": scheduler_size,
         }
 
+    def _domain_resumed(self, domain_id: int, reason: str) -> None:
+        stalled_at = self._domain_stalled.pop(domain_id, None)
+        if stalled_at is not None:
+            logger.info(
+                "spider.domain_resumed",
+                extra={
+                    "event": "spider.domain_resumed",
+                    "domain_id": domain_id,
+                    "stalled_sec": round(monotonic() - stalled_at),
+                    "reason": reason,
+                },
+            )
+
+    def _domain_stall_runtime(self) -> dict[str, int | None]:
+        """Open domain batches with no finished request for a while.
+
+        The spider takes a domain's next queue file only after every request
+        of its current batch finished, so one request that never calls back
+        stops that whole domain until a restart.
+        """
+        now = monotonic()
+        oldest_id, oldest_idle = None, 0.0
+        stalled = 0
+        for domain_id, progress in self._domain_progress.items():
+            idle = now - progress
+            if idle > oldest_idle:
+                oldest_id, oldest_idle = domain_id, idle
+            if self.domain_stall_warn_sec and idle >= self.domain_stall_warn_sec:
+                stalled += 1
+                if domain_id not in self._domain_stalled:
+                    self._domain_stalled[domain_id] = now
+                    logger.warning(
+                        "spider.domain_stalled",
+                        extra={
+                            "event": "spider.domain_stalled",
+                            "domain_id": domain_id,
+                            "pending": self._domain_pending.get(domain_id, 0),
+                            "idle_sec": round(idle),
+                        },
+                    )
+        return {
+            "stalled_domains": stalled,
+            "oldest_domain_idle_sec": round(oldest_idle),
+            "oldest_idle_domain_id": oldest_id,
+        }
+
     def _log(self, message: str):
         runtime = self._downloader_runtime()
         logger.info(
@@ -191,6 +245,7 @@ class HtmlSpider(scrapy.Spider):
 
     def _build_request(self, url: str, domain_id: int) -> scrapy.Request:
         self._domain_pending[domain_id] = self._domain_pending.get(domain_id, 0) + 1
+        self._domain_progress[domain_id] = monotonic()
         return scrapy.Request(
             url=url,
             callback=self.parse,
@@ -282,8 +337,11 @@ class HtmlSpider(scrapy.Spider):
         self._pending_requests = max(0, self._pending_requests - 1)
         if domain_id and domain_id in self._domain_pending:
             self._domain_pending[domain_id] -= 1
+            self._domain_progress[domain_id] = monotonic()
+            self._domain_resumed(domain_id, reason)
             if self._domain_pending[domain_id] <= 0:
                 del self._domain_pending[domain_id]
+                del self._domain_progress[domain_id]
         self._set_inflight_stats()
         if len(self._domain_pending) < self.domain_low_watermark:
             self._maybe_top_up(reason=f"{reason}_low_watermark")
@@ -314,6 +372,7 @@ class HtmlSpider(scrapy.Spider):
                 "autothrottle_max_delay": settings.getfloat(
                     "AUTOTHROTTLE_MAX_DELAY", 0.0
                 ),
+                "domain_stall_warn_sec": self.domain_stall_warn_sec,
             },
         )
         self._set_inflight_stats()
@@ -344,6 +403,8 @@ class HtmlSpider(scrapy.Spider):
         )
         stats = self.crawler.stats
         consumer = self.manual_bulk_crawls
+        stall_runtime = self._domain_stall_runtime()
+        queue_runtime = self.queue.stats()
 
         logger.info(
             "spider.heartbeat",
@@ -373,6 +434,8 @@ class HtmlSpider(scrapy.Spider):
                 "dequeued_manual": stats.get_value("scheduler/dequeued/manual", 0),
                 "manual_saves": consumer.saves,
                 "manual_save_ms": round(consumer.save_seconds * 1000),
+                **stall_runtime,
+                **queue_runtime,
             },
         )
 

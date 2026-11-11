@@ -91,6 +91,9 @@ IPC_DOMAIN_LOW_WATERMARK = 144
 # spider_idle are not enough once owned work has drained while manual bulk
 # crawls keep the engine busy.
 IPC_TOP_UP_INTERVAL_SEC = 5.0
+# Warn (spider.domain_stalled) when an open domain batch has had no request
+# finish for this long; 0 disables the warning.
+DOMAIN_STALL_WARN_SEC = float(os.getenv("CRAWLER_DOMAIN_STALL_WARN_SEC", "600"))
 
 DNS_TIMEOUT = 15
 DOWNLOAD_TIMEOUT = 15

@@ -370,7 +370,7 @@ def test_manual_and_normal_requests_share_the_hostname_slot(queue, monkeypatch):
                                    "CONCURRENT_REQUESTS_PER_DOMAIN": 16})
     crawler.spider = Spider(name="slot-test")
     downloader = Downloader(crawler)
-    spider = SimpleNamespace(_domain_pending={}, parse=None, errback=None)
+    spider = SimpleNamespace(_domain_pending={}, _domain_progress={}, parse=None, errback=None)
     normal = HtmlSpider._build_request(spider, "https://www.espn.com/nba/2", 7)
     try:
         consumer.poll()

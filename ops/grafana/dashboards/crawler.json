@@ -174,6 +174,238 @@
     {
       "collapsed": false,
       "gridPos": {"h": 1, "w": 24, "x": 0, "y": 18},
+      "id": 102,
+      "title": "Stuck domain batches",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 19},
+      "id": 20,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "refId": "A",
+          "expr": "sum by (src) (count_over_time({service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.start\"} |~ `\"domain\": \"[^\"]*wikipedia\\.org\"` | json src=\"source\" [5m]))",
+          "legendFormat": "{{src}}"
+        }
+      ],
+      "title": "Wikipedia fetch starts by source (per 5m)",
+      "description": "Normal (offerer queue) vs manual (bulk crawl API) request.start on *.wikipedia.org. All of wikipedia.org is one domain, so normal at 0 while manual keeps running means its batch is stuck on the worker that owns shard 0 (crawler_00): see the panels below. Lines logged before the source field existed show an empty source.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 19},
+      "id": 21,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "refId": "A",
+          "expr": "avg by (worker_id) (avg_over_time({service=\"crawler\", worker_id=~\"$worker_id\", event=\"spider.heartbeat\"} | json | unwrap normal_active | __error__=\"\" [1m]))",
+          "legendFormat": "normal crawler_{{worker_id}}"
+        },
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "refId": "B",
+          "expr": "avg by (worker_id) (avg_over_time({service=\"crawler\", worker_id=~\"$worker_id\", event=\"spider.heartbeat\"} | json | unwrap manual_active | __error__=\"\" [1m]))",
+          "legendFormat": "manual crawler_{{worker_id}}"
+        }
+      ],
+      "title": "Active downloads by source per worker",
+      "description": "Downloads in progress per worker, split into normal and manual (heartbeat normal_active / manual_active).",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "thresholdsStyle": {"mode": "line+area"}
+          },
+          "unit": "m",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 10}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 27},
+      "id": 22,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "refId": "A",
+          "expr": "max by (worker_id) (max_over_time({service=\"crawler\", worker_id=~\"$worker_id\", event=\"spider.heartbeat\"} | json | unwrap oldest_domain_idle_sec | __error__=\"\" [1m])) / 60",
+          "legendFormat": "crawler_{{worker_id}}"
+        }
+      ],
+      "title": "Oldest idle domain batch per worker (minutes)",
+      "description": "Longest time any open domain batch on the worker has gone without a finished request (heartbeat oldest_domain_idle_sec). The spider takes a domain's next queue file only after its whole batch finished, so a value that keeps climbing means one lost request is blocking that domain (heartbeat oldest_idle_domain_id names it). Red from 10 min (CRAWLER_DOMAIN_STALL_WARN_SEC default).",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "thresholdsStyle": {"mode": "line+area"}
+          },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 27},
+      "id": 23,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "refId": "A",
+          "expr": "max by (worker_id) (max_over_time({service=\"crawler\", worker_id=~\"$worker_id\", event=\"spider.heartbeat\"} | json | unwrap stalled_domains | __error__=\"\" [1m]))",
+          "legendFormat": "crawler_{{worker_id}}"
+        }
+      ],
+      "title": "Stalled domain batches per worker",
+      "description": "Open domain batches with no finished request for CRAWLER_DOMAIN_STALL_WARN_SEC (default 600 s). Each one also logs a spider.domain_stalled warning.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "thresholdsStyle": {"mode": "line+area"}
+          },
+          "unit": "m",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 30}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 27},
+      "id": 24,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "refId": "A",
+          "expr": "max by (worker_id) (max_over_time({service=\"crawler\", worker_id=~\"$worker_id\", event=\"spider.heartbeat\"} | json | unwrap queue_oldest_age_sec | __error__=\"\" [1m])) / 60",
+          "legendFormat": "crawler_{{worker_id}}"
+        }
+      ],
+      "title": "Oldest waiting queue file per worker (minutes)",
+      "description": "Age of the oldest domain_*.json waiting in the worker's url_queue (heartbeat queue_oldest_age_sec). Files are taken oldest first, so a file that keeps aging belongs to a domain the spider excludes because its previous batch is still open.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 35},
+      "id": 25,
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": false,
+        "showCommonLabels": false,
+        "showLabels": true,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      },
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "expr": "{service=\"crawler\", worker_id=~\"$worker_id\", event=~\"spider\\\\.domain_(stalled|resumed)\"}",
+          "refId": "A"
+        }
+      ],
+      "title": "Domain stall events",
+      "description": "spider.domain_stalled (domain_id, pending, idle_sec) and spider.domain_resumed (stalled_sec, reason). A stall with no resume needs a fix or a worker restart.",
+      "type": "logs"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 43},
       "id": 100,
       "title": "Crawler internals (tuning)",
       "type": "row"
@@ -194,7 +426,7 @@
         },
         "overrides": []
       },
-      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 19},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 44},
       "id": 6,
       "options": {
         "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["mean", "max"]},
@@ -228,7 +460,7 @@
         },
         "overrides": []
       },
-      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 19},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 44},
       "id": 7,
       "options": {
         "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["mean", "max"]},
@@ -262,7 +494,7 @@
         },
         "overrides": []
       },
-      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 19},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 44},
       "id": 8,
       "options": {
         "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["mean", "max"]},
@@ -296,7 +528,7 @@
         },
         "overrides": []
       },
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 27},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 52},
       "id": 9,
       "options": {
         "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["mean", "max"]},
@@ -330,7 +562,7 @@
         },
         "overrides": []
       },
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 27},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 52},
       "id": 10,
       "options": {
         "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["mean", "max"]},
@@ -350,14 +582,14 @@
     },
     {
       "collapsed": false,
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 35},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 60},
       "id": 101,
       "title": "Errors",
       "type": "row"
     },
     {
       "datasource": {"type": "loki", "uid": "loki"},
-      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 36},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 61},
       "id": 5,
       "options": {
         "dedupStrategy": "none",

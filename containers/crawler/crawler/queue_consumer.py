@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,6 +53,19 @@ class QueueConsumer:
 
     def __init__(self, queue_dir: str):
         self.queue_dir = Path(queue_dir)
+
+    def stats(self) -> dict[str, int]:
+        """Waiting domain files, and how long the oldest one has waited."""
+        try:
+            entries = [entry for f in self.queue_dir.iterdir()
+                       if (entry := _parse_domain_queue_file(f)) is not None]
+        except OSError:
+            entries = []
+        oldest = min((entry.mtime_ns for entry in entries), default=None)
+        return {
+            "queue_files": len(entries),
+            "queue_oldest_age_sec": 0 if oldest is None else max(0, round(time.time() - oldest / 1e9)),
+        }
 
     def pop_domain_batches(
         self,
