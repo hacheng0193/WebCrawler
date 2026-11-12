@@ -3,6 +3,9 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from typing import Any, Optional
+
+import numpy as np
 
 from psycopg2.extras import execute_values
 from sqlalchemy.orm import sessionmaker
@@ -47,16 +50,55 @@ class GoldenDiscoveryRankerConfig:
     min_age_days: int = 3
 
 
+def _ranks(x: np.ndarray) -> np.ndarray:
+    order = np.argsort(x, kind="stable")
+    r = np.empty(len(x), dtype=np.float64)
+    r[order] = np.arange(len(x))
+    return r
+
+
+def shadow_stats(current: np.ndarray, shadow: np.ndarray) -> dict[str, float]:
+    """Agreement between the live score and the MGL shadow on one batch.
+
+    expected_golden is the sum of calibrated P_self, i.e. how many next-batch
+    golden URLs the shadow expects in this batch.
+    """
+    n = len(shadow)
+    if n == 0:
+        return {"n": 0}
+    k = max(1, n // 10)
+    top_cur = set(np.argsort(-current, kind="stable")[:k].tolist())
+    top_sh = set(np.argsort(-shadow, kind="stable")[:k].tolist())
+    if n > 1 and np.ptp(current) > 0 and np.ptp(shadow) > 0:
+        spearman = float(np.corrcoef(_ranks(current), _ranks(shadow))[0, 1])
+    else:
+        spearman = 0.0
+    return {
+        "n": n,
+        "spearman": round(spearman, 4),
+        "top10_overlap": round(len(top_cur & top_sh) / k, 4),
+        "expected_golden": round(float(shadow.sum()), 6),
+        "shadow_p50": float(np.percentile(shadow, 50)),
+        "shadow_p90": float(np.percentile(shadow, 90)),
+        "shadow_max": float(shadow.max()),
+    }
+
+
 class GoldenDiscoveryRankerService:
     def __init__(
         self,
         cfg: GoldenDiscoveryRankerConfig,
         Session: sessionmaker,
         scorer: GoldenDiscoveryRuntimeScorer,
+        shadow_scorer: Optional[Any] = None,
     ):
         self.cfg = cfg
         self.Session = Session
         self.scorer = scorer
+        # MGL P_self shadow (fable-crawl-selection DESIGN.md, step R1): scores the
+        # same batch with the candidate model and logs how it would re-rank it.
+        # Never written to the DB; None = off.
+        self.shadow_scorer = shadow_scorer
 
     @staticmethod
     def _table(shard_id: int) -> str:
@@ -141,11 +183,13 @@ class GoldenDiscoveryRankerService:
                     params.extend([self.cfg.batch_size, shard_id, self.cfg.batch_size])
                     cur.execute(
                         f"""
-                        SELECT u.url, u.inlink_count_approx, u.inlink_count_external, u.anchor_text
+                        SELECT u.url, u.inlink_count_approx, u.inlink_count_external, u.anchor_text,
+                               u.discovery_source_type, u.discovered_from
                         FROM domain_state d
                         CROSS JOIN LATERAL (
                             SELECT url, inlink_count_approx, inlink_count_external,
-                                   anchor_text, url_score_updated_at
+                                   anchor_text, discovery_source_type, discovered_from,
+                                   url_score_updated_at
                             FROM {table} u
                             WHERE u.domain_id = d.domain_id
                               AND u.should_crawl = TRUE
@@ -167,7 +211,8 @@ class GoldenDiscoveryRankerService:
                 else:
                     cur.execute(
                         f"""
-                        SELECT url, inlink_count_approx, inlink_count_external, anchor_text
+                        SELECT url, inlink_count_approx, inlink_count_external, anchor_text,
+                               discovery_source_type, discovered_from
                         FROM {table}
                         WHERE should_crawl = TRUE
                           AND url_score_updated_at IS NULL
@@ -200,6 +245,8 @@ class GoldenDiscoveryRankerService:
                 else:
                     scores = self.scorer.score_many(urls)
                 rows = list(zip(urls, scores))
+                if self.shadow_scorer is not None:
+                    self._log_shadow(shard_id, fetched, scores)
 
                 # Keep score history compact: the ranker refreshes
                 # current.url_score in place and uses url_score_updated_at as
@@ -229,6 +276,43 @@ class GoldenDiscoveryRankerService:
             },
         )
         return scored
+
+    def _log_shadow(self, shard_id: int, fetched: list, scores: list[float]) -> None:
+        """Log how the MGL P_self model would rank this batch. Failures are logged, never raised."""
+        try:
+            recs = [
+                {
+                    "url": row[0],
+                    "inlink_count_approx": row[1],
+                    "inlink_count_external": row[2],
+                    "anchor_text": row[3],
+                    "discovery_source_type": row[4],
+                    "discovered_from": row[5],
+                }
+                for row in fetched
+            ]
+            shadow = np.asarray(self.shadow_scorer.score_many_rows(recs), dtype=np.float64)
+            stats = shadow_stats(np.asarray(scores, dtype=np.float64), shadow)
+        except Exception as e:
+            logger.error(
+                "golden_discovery_ranker_v1.mgl_shadow_error",
+                extra={
+                    "event": "golden_discovery_ranker_v1.mgl_shadow_error",
+                    "worker_id": self.cfg.worker_id,
+                    "shard_id": shard_id,
+                    "error": str(e),
+                },
+            )
+            return
+        logger.info(
+            "golden_discovery_ranker_v1.mgl_shadow",
+            extra={
+                "event": "golden_discovery_ranker_v1.mgl_shadow",
+                "worker_id": self.cfg.worker_id,
+                "shard_id": shard_id,
+                **stats,
+            },
+        )
 
     def run_once(self) -> dict[str, int]:
         totals = {"scored_urls": 0, "scored_batches": 0}

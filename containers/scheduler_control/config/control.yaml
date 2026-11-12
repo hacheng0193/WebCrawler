@@ -111,3 +111,12 @@ golden_discovery_ranker_v1:
   #     Override with GOLDEN_DISCOVERY_RANKER_V1_MIN_AGE_DAYS. 0 = no gate.
   rescore_ttl_days: 5
   min_age_days: 3
+  # MGL P_self shadow (step R1 of the MGL scorer design). When on, every scored
+  # batch is also scored by the MGL frontier model and one
+  # golden_discovery_ranker_v1.mgl_shadow log line records how it would re-rank
+  # the batch (spearman vs live score, top-10% overlap, expected golden).
+  # Shadow scores are never written to the DB. Off by default; kill switch:
+  # GOLDEN_DISCOVERY_RANKER_V1_MGL_SHADOW_ENABLED=false. A missing or invalid
+  # artifact logs mgl_shadow.disabled and the ranker keeps running without it.
+  mgl_shadow_enabled: false
+  mgl_shadow_artifact: "/app/artifacts/mgl_pself_v1.joblib"

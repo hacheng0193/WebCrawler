@@ -13,6 +13,7 @@ from libs.config.loader import load_yaml, require
 from libs.obslog import configure as configure_logging
 from libs.scoring.golden_discovery_runtime import GoldenDiscoveryRuntimeScorer
 from libs.scoring.golden_discovery_runtime_v2 import GoldenDiscoveryRuntimeScorerV2
+from libs.scoring.mgl_pself_runtime import MglPselfScorer
 
 from .service import GoldenDiscoveryRankerConfig, GoldenDiscoveryRankerService
 
@@ -38,6 +39,34 @@ def _env_int(name: str, default: int) -> int:
 def _env_str(name: str, default: str) -> str:
     value = os.environ.get(name)
     return value if value not in (None, "") else default
+
+
+def load_mgl_shadow(scorer_raw: dict[str, Any], worker_id: int):
+    """MGL P_self shadow scorer, or None. Never fails startup: a bad artifact only disables the shadow."""
+    enabled = _env_bool(f"{ENV_PREFIX}_MGL_SHADOW_ENABLED", bool(scorer_raw.get("mgl_shadow_enabled", False)))
+    path = _env_str(f"{ENV_PREFIX}_MGL_SHADOW_ARTIFACT", str(scorer_raw.get("mgl_shadow_artifact", "")))
+    if enabled:
+        try:
+            shadow = MglPselfScorer.load(path)
+        except Exception as e:
+            logger.error(
+                f"{SERVICE_NAME}.mgl_shadow.disabled",
+                extra={"event": f"{SERVICE_NAME}.mgl_shadow.disabled", "worker_id": worker_id,
+                       "reason": "artifact_load_failed", "artifact_path": path, "error": str(e)},
+            )
+            return None
+        logger.info(
+            f"{SERVICE_NAME}.mgl_shadow.enabled",
+            extra={"event": f"{SERVICE_NAME}.mgl_shadow.enabled", "worker_id": worker_id,
+                   "artifact_path": path, "model_name": shadow.metadata.get("model_name"),
+                   "score_version": shadow.metadata.get("score_version")},
+        )
+        return shadow
+    logger.info(
+        f"{SERVICE_NAME}.mgl_shadow.disabled",
+        extra={"event": f"{SERVICE_NAME}.mgl_shadow.disabled", "worker_id": worker_id, "reason": "config"},
+    )
+    return None
 
 
 def main() -> None:
@@ -140,7 +169,8 @@ def main() -> None:
         ),
     )
 
-    svc = GoldenDiscoveryRankerService(cfg=cfg, Session=Session, scorer=scorer)
+    shadow_scorer = load_mgl_shadow(scorer_raw, worker_id)
+    svc = GoldenDiscoveryRankerService(cfg=cfg, Session=Session, scorer=scorer, shadow_scorer=shadow_scorer)
     if args.once:
         svc.run_once()
         return
