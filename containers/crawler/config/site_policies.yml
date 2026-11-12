@@ -181,9 +181,12 @@ hosts:
       max_qps: 3
       max_concurrent_requests: 4
   www.youtube.com:
+    # No 429s at 4 concurrent / 0.35 rps (2026-11); manual API jobs were bound
+    # by the 4-request cap, not by YouTube. AutoThrottle still backs off.
     request_limits:
       max_qps: 3
-      max_concurrent_requests: 4
+      max_concurrent_requests: 16
+      target_concurrent_requests: 8
   xtpx.597.com:
     request_limits:
       max_qps: 3
