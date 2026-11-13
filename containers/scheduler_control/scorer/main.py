@@ -41,32 +41,40 @@ def _env_str(name: str, default: str) -> str:
     return value if value not in (None, "") else default
 
 
-def load_mgl_shadow(scorer_raw: dict[str, Any], worker_id: int):
-    """MGL P_self shadow scorer, or None. Never fails startup: a bad artifact only disables the shadow."""
-    enabled = _env_bool(f"{ENV_PREFIX}_MGL_SHADOW_ENABLED", bool(scorer_raw.get("mgl_shadow_enabled", False)))
+def load_mgl(scorer_raw: dict[str, Any], worker_id: int):
+    """(MGL P_self scorer or None, live flag). Never fails startup: a bad artifact only disables MGL.
+
+    mgl_shadow_enabled logs how MGL would re-rank each batch; mgl_live_enabled
+    writes the MGL score to url_score instead of the v2 score (step R2). Both
+    use mgl_shadow_artifact. Startup always logs mgl_shadow.* and mgl_live.*.
+    """
+    shadow_on = _env_bool(f"{ENV_PREFIX}_MGL_SHADOW_ENABLED", bool(scorer_raw.get("mgl_shadow_enabled", False)))
+    live_on = _env_bool(f"{ENV_PREFIX}_MGL_LIVE_ENABLED", bool(scorer_raw.get("mgl_live_enabled", False)))
     path = _env_str(f"{ENV_PREFIX}_MGL_SHADOW_ARTIFACT", str(scorer_raw.get("mgl_shadow_artifact", "")))
-    if enabled:
+
+    def _log(kind: str, on: bool, **extra) -> None:
+        state = "enabled" if on else "disabled"
+        log = logger.info if on or extra.get("reason") == "config" else logger.error
+        log(f"{SERVICE_NAME}.{kind}.{state}",
+            extra={"event": f"{SERVICE_NAME}.{kind}.{state}", "worker_id": worker_id, **extra})
+
+    mgl = None
+    failed: dict[str, str] = {}
+    if shadow_on or live_on:
         try:
-            shadow = MglPselfScorer.load(path)
+            mgl = MglPselfScorer.load(path)
         except Exception as e:
-            logger.error(
-                f"{SERVICE_NAME}.mgl_shadow.disabled",
-                extra={"event": f"{SERVICE_NAME}.mgl_shadow.disabled", "worker_id": worker_id,
-                       "reason": "artifact_load_failed", "artifact_path": path, "error": str(e)},
-            )
-            return None
-        logger.info(
-            f"{SERVICE_NAME}.mgl_shadow.enabled",
-            extra={"event": f"{SERVICE_NAME}.mgl_shadow.enabled", "worker_id": worker_id,
-                   "artifact_path": path, "model_name": shadow.metadata.get("model_name"),
-                   "score_version": shadow.metadata.get("score_version")},
-        )
-        return shadow
-    logger.info(
-        f"{SERVICE_NAME}.mgl_shadow.disabled",
-        extra={"event": f"{SERVICE_NAME}.mgl_shadow.disabled", "worker_id": worker_id, "reason": "config"},
-    )
-    return None
+            failed = {"reason": "artifact_load_failed", "artifact_path": path, "error": str(e)}
+    loaded = {"artifact_path": path, "model_name": mgl.metadata.get("model_name"),
+              "score_version": mgl.metadata.get("score_version")} if mgl is not None else {}
+    for kind, on in (("mgl_shadow", shadow_on), ("mgl_live", live_on)):
+        if not on:
+            _log(kind, False, reason="config")
+        elif mgl is None:
+            _log(kind, False, **failed)
+        else:
+            _log(kind, True, **loaded)
+    return mgl, bool(live_on and mgl is not None)
 
 
 def main() -> None:
@@ -169,8 +177,9 @@ def main() -> None:
         ),
     )
 
-    shadow_scorer = load_mgl_shadow(scorer_raw, worker_id)
-    svc = GoldenDiscoveryRankerService(cfg=cfg, Session=Session, scorer=scorer, shadow_scorer=shadow_scorer)
+    mgl_scorer, mgl_live = load_mgl(scorer_raw, worker_id)
+    svc = GoldenDiscoveryRankerService(cfg=cfg, Session=Session, scorer=scorer,
+                                       shadow_scorer=mgl_scorer, mgl_live=mgl_live)
     if args.once:
         svc.run_once()
         return

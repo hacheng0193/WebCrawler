@@ -120,3 +120,14 @@ golden_discovery_ranker_v1:
   # artifact logs mgl_shadow.disabled and the ranker keeps running without it.
   mgl_shadow_enabled: false
   mgl_shadow_artifact: "/app/artifacts/mgl_pself_v1.joblib"
+  # MGL P_self live (step R2). When on, the ranker writes the MGL score (a
+  # calibrated next-batch golden probability, no golden-derived feature) to
+  # url_score instead of the v2 score, using mgl_shadow_artifact. Scope, TTL and
+  # min-age gates are unchanged, and url_score > 1 (inject/manual) is still never
+  # touched. Live wins over shadow: v2 is not computed for live batches. A batch
+  # whose MGL scoring fails logs mgl_live_error and writes the v2 score. Startup
+  # logs mgl_live.enabled / mgl_live.disabled (reason config or
+  # artifact_load_failed). Off by default; kill switch:
+  # GOLDEN_DISCOVERY_RANKER_V1_MGL_LIVE_ENABLED=false, then restart the workers
+  # (rows already written keep the MGL score until the TTL re-scores them).
+  mgl_live_enabled: false

@@ -1,4 +1,4 @@
-"""Tests for the MGL P_self shadow scorer.
+"""Tests for the MGL P_self scorer (shadow and live modes).
 
 What we're protecting:
 
@@ -7,11 +7,15 @@ What we're protecting:
   * The artifact loader rejects a feature-version or column-count mismatch.
   * The ranker's shadow hook only logs: it never changes what is written to
     url_score, and a failing shadow model never breaks a scoring batch.
-  * A missing shadow artifact disables the shadow instead of failing startup.
+  * Live mode writes the MGL score; a failing MGL batch falls back to the
+    legacy score instead of failing.
+  * A missing artifact disables shadow and live instead of failing startup,
+    and the env kill switch turns live off.
 """
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,7 +26,7 @@ import numpy as np
 from scipy import sparse
 
 import containers.scheduler_control.scorer.service as service_mod
-from containers.scheduler_control.scorer.main import load_mgl_shadow
+from containers.scheduler_control.scorer.main import load_mgl
 from containers.scheduler_control.scorer.service import (
     GoldenDiscoveryRankerConfig,
     GoldenDiscoveryRankerService,
@@ -172,13 +176,13 @@ class _Shadow:
 class ServiceShadowTest(unittest.TestCase):
     ROWS = [(f"https://a.com/{i}", i, 0, "anchor", 1, "https://a.com/") for i in range(5)]
 
-    def _run(self, shadow):
+    def _run(self, shadow, live=False):
         cur = _Cursor(list(self.ROWS))
         cfg = GoldenDiscoveryRankerConfig(total_shards=256, num_workers=1, worker_id=0, batch_size=10,
                                           scan_interval_sec=60, max_batches_per_shard=1,
                                           domain_priority_steering_enabled=True)
         svc = GoldenDiscoveryRankerService(cfg=cfg, Session=_Session(cur), scorer=_LiveScorer(),
-                                           shadow_scorer=shadow)
+                                           shadow_scorer=shadow, mgl_live=live)
         written = []
         orig = service_mod.execute_values
         service_mod.execute_values = lambda c, sql, rows, page_size=None: written.extend(rows)
@@ -207,26 +211,86 @@ class ServiceShadowTest(unittest.TestCase):
         self.assertTrue(any("mgl_shadow_error" in line for line in logs))
 
 
+class ServiceLiveTest(unittest.TestCase):
+    ROWS = ServiceShadowTest.ROWS
+    _run = ServiceShadowTest._run
+
+    def test_live_writes_mgl_scores(self):
+        mgl = _Shadow()
+        n, written, logs, _ = self._run(mgl, live=True)
+        self.assertEqual(n, 5)
+        self.assertEqual([s for _, s in written], [0.001 * i for i in range(5)])
+        self.assertFalse(any("mgl_shadow" in line for line in logs))
+        self.assertTrue(any("score_batch" in line for line in logs))
+        self.assertEqual(mgl.recs[3]["discovery_source_type"], 1)
+
+    def test_live_failure_falls_back_to_legacy_scores(self):
+        n, written, logs, _ = self._run(_Shadow(fail=True), live=True)
+        _, base_written, _, _ = self._run(None)
+        self.assertEqual(n, 5)
+        self.assertEqual(written, base_written)
+        self.assertTrue(any("mgl_live_error" in line for line in logs))
+        self.assertFalse(any("mgl_shadow_error" in line for line in logs))
+
+    def test_live_without_scorer_is_off(self):
+        _, written, _, _ = self._run(None, live=True)
+        _, base_written, _, _ = self._run(None)
+        self.assertEqual(written, base_written)
+
+
 class LoaderTest(unittest.TestCase):
+    def _events(self, logs):
+        return {getattr(r, "event", None): r for r in logs.records}
+
     def test_disabled_by_default(self):
         with self.assertLogs("golden_discovery_ranker_v1", level="INFO") as logs:
-            self.assertIsNone(load_mgl_shadow({}, 0))
-        self.assertTrue(any("mgl_shadow.disabled" in line for line in logs.output))
+            self.assertEqual(load_mgl({}, 0), (None, False))
+        ev = self._events(logs)
+        self.assertEqual(ev["golden_discovery_ranker_v1.mgl_shadow.disabled"].reason, "config")
+        self.assertEqual(ev["golden_discovery_ranker_v1.mgl_live.disabled"].reason, "config")
 
     def test_missing_artifact_disables_instead_of_failing(self):
         with self.assertLogs("golden_discovery_ranker_v1", level="INFO") as logs:
-            self.assertIsNone(load_mgl_shadow({"mgl_shadow_enabled": True,
-                                               "mgl_shadow_artifact": "/nonexistent.joblib"}, 0))
-        self.assertTrue(any(getattr(r, "reason", None) == "artifact_load_failed" for r in logs.records))
+            self.assertEqual(load_mgl({"mgl_shadow_enabled": True, "mgl_live_enabled": True,
+                                       "mgl_shadow_artifact": "/nonexistent.joblib"}, 0), (None, False))
+        ev = self._events(logs)
+        self.assertEqual(ev["golden_discovery_ranker_v1.mgl_shadow.disabled"].reason, "artifact_load_failed")
+        self.assertEqual(ev["golden_discovery_ranker_v1.mgl_live.disabled"].reason, "artifact_load_failed")
 
-    def test_enabled_with_artifact(self):
+    def test_shadow_only(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "a.joblib"
             _tiny_artifact(p)
             with self.assertLogs("golden_discovery_ranker_v1", level="INFO") as logs:
-                sc = load_mgl_shadow({"mgl_shadow_enabled": True, "mgl_shadow_artifact": str(p)}, 0)
+                sc, live = load_mgl({"mgl_shadow_enabled": True, "mgl_shadow_artifact": str(p)}, 0)
         self.assertIsInstance(sc, MglPselfScorer)
-        self.assertTrue(any("mgl_shadow.enabled" in line for line in logs.output))
+        self.assertFalse(live)
+        ev = self._events(logs)
+        self.assertIn("golden_discovery_ranker_v1.mgl_shadow.enabled", ev)
+        self.assertIn("golden_discovery_ranker_v1.mgl_live.disabled", ev)
+
+    def test_live_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "a.joblib"
+            _tiny_artifact(p)
+            with self.assertLogs("golden_discovery_ranker_v1", level="INFO") as logs:
+                sc, live = load_mgl({"mgl_live_enabled": True, "mgl_shadow_artifact": str(p)}, 0)
+        self.assertIsInstance(sc, MglPselfScorer)
+        self.assertTrue(live)
+        self.assertIn("golden_discovery_ranker_v1.mgl_live.enabled", self._events(logs))
+
+    def test_env_kill_switch(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "a.joblib"
+            _tiny_artifact(p)
+            os.environ["GOLDEN_DISCOVERY_RANKER_V1_MGL_LIVE_ENABLED"] = "false"
+            try:
+                with self.assertLogs("golden_discovery_ranker_v1", level="INFO"):
+                    sc, live = load_mgl({"mgl_live_enabled": True, "mgl_shadow_artifact": str(p)}, 0)
+            finally:
+                del os.environ["GOLDEN_DISCOVERY_RANKER_V1_MGL_LIVE_ENABLED"]
+        self.assertIsNone(sc)
+        self.assertFalse(live)
 
 
 if __name__ == "__main__":

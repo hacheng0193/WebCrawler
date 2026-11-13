@@ -91,6 +91,7 @@ class GoldenDiscoveryRankerService:
         Session: sessionmaker,
         scorer: GoldenDiscoveryRuntimeScorer,
         shadow_scorer: Optional[Any] = None,
+        mgl_live: bool = False,
     ):
         self.cfg = cfg
         self.Session = Session
@@ -99,6 +100,9 @@ class GoldenDiscoveryRankerService:
         # same batch with the candidate model and logs how it would re-rank it.
         # Never written to the DB; None = off.
         self.shadow_scorer = shadow_scorer
+        # Step R2: write the MGL score to url_score instead of the v2 score.
+        # Needs shadow_scorer; a batch whose MGL scoring fails falls back to v2.
+        self.mgl_live = mgl_live and shadow_scorer is not None
 
     @staticmethod
     def _table(shard_id: int) -> str:
@@ -228,25 +232,15 @@ class GoldenDiscoveryRankerService:
                     return 0
                 urls = [row[0] for row in fetched]
 
-                # v2 ranker consumes prefetch features (inlink/anchor) via
-                # score_many_rows; v1 only needs the URL string. Detect by
-                # capability so this path stays drop-in for both.
-                if hasattr(self.scorer, "score_many_rows"):
-                    recs = [
-                        {
-                            "url": row[0],
-                            "inlink_count_approx": row[1],
-                            "inlink_count_external": row[2],
-                            "anchor_text": row[3],
-                        }
-                        for row in fetched
-                    ]
-                    scores = self.scorer.score_many_rows(recs)
-                else:
-                    scores = self.scorer.score_many(urls)
+                scores = self._mgl_live_scores(shard_id, fetched) if self.mgl_live else None
+                model = "mgl" if scores is not None else "legacy"
+                if scores is None:
+                    scores = self._legacy_scores(fetched, urls)
+                    # Shadow compare only when MGL is not live: a live batch
+                    # skips v2, and a failed live batch would just fail again.
+                    if self.shadow_scorer is not None and not self.mgl_live:
+                        self._log_shadow(shard_id, fetched, scores)
                 rows = list(zip(urls, scores))
-                if self.shadow_scorer is not None:
-                    self._log_shadow(shard_id, fetched, scores)
 
                 # Keep score history compact: the ranker refreshes
                 # current.url_score in place and uses url_score_updated_at as
@@ -273,24 +267,62 @@ class GoldenDiscoveryRankerService:
                 "worker_id": self.cfg.worker_id,
                 "shard_id": shard_id,
                 "scored_urls": scored,
+                "model": model,
             },
         )
         return scored
 
-    def _log_shadow(self, shard_id: int, fetched: list, scores: list[float]) -> None:
-        """Log how the MGL P_self model would rank this batch. Failures are logged, never raised."""
-        try:
+    def _legacy_scores(self, fetched: list, urls: list[str]) -> list[float]:
+        # v2 ranker consumes prefetch features (inlink/anchor) via
+        # score_many_rows; v1 only needs the URL string. Detect by
+        # capability so this path stays drop-in for both.
+        if hasattr(self.scorer, "score_many_rows"):
             recs = [
                 {
                     "url": row[0],
                     "inlink_count_approx": row[1],
                     "inlink_count_external": row[2],
                     "anchor_text": row[3],
-                    "discovery_source_type": row[4],
-                    "discovered_from": row[5],
                 }
                 for row in fetched
             ]
+            return self.scorer.score_many_rows(recs)
+        return self.scorer.score_many(urls)
+
+    @staticmethod
+    def _mgl_recs(fetched: list) -> list[dict]:
+        return [
+            {
+                "url": row[0],
+                "inlink_count_approx": row[1],
+                "inlink_count_external": row[2],
+                "anchor_text": row[3],
+                "discovery_source_type": row[4],
+                "discovered_from": row[5],
+            }
+            for row in fetched
+        ]
+
+    def _mgl_live_scores(self, shard_id: int, fetched: list) -> Optional[list[float]]:
+        """MGL scores to write, or None so the batch falls back to the legacy scorer."""
+        try:
+            return self.shadow_scorer.score_many_rows(self._mgl_recs(fetched))
+        except Exception as e:
+            logger.error(
+                "golden_discovery_ranker_v1.mgl_live_error",
+                extra={
+                    "event": "golden_discovery_ranker_v1.mgl_live_error",
+                    "worker_id": self.cfg.worker_id,
+                    "shard_id": shard_id,
+                    "error": str(e),
+                },
+            )
+            return None
+
+    def _log_shadow(self, shard_id: int, fetched: list, scores: list[float]) -> None:
+        """Log how the MGL P_self model would rank this batch. Failures are logged, never raised."""
+        try:
+            recs = self._mgl_recs(fetched)
             shadow = np.asarray(self.shadow_scorer.score_many_rows(recs), dtype=np.float64)
             stats = shadow_stats(np.asarray(scores, dtype=np.float64), shadow)
         except Exception as e:
